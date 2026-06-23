@@ -1,0 +1,131 @@
+name: Version drift check
+
+# Confirms that the plugin version is consistent across all three places it
+# is duplicated: the WordPress plugin header, the ZYMARG_WCPG_VERSION constant,
+# and the readme.txt Stable tag. Fails the build on drift.
+#
+# Also runs a `php -l` lint pass over every PHP file inside the plugin zip
+# so a syntax error never reaches a live site.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  version-drift:
+    name: Verify version consistency + PHP lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.1"
+          tools: none
+
+      - name: Locate plugin zip
+        id: locate
+        run: |
+          set -euo pipefail
+          ZIP_PATH=$(find . -maxdepth 2 -type f -name "ZYMARG WC Product Grid *.zip" | head -n 1 || true)
+          if [ -z "$ZIP_PATH" ]; then
+            echo "::error::No ZYMARG WC Product Grid zip file found in repo root."
+            exit 1
+          fi
+          echo "Found zip: $ZIP_PATH"
+          echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Unzip plugin
+        run: |
+          set -euo pipefail
+          mkdir -p _ci_extract
+          unzip -q "${{ steps.locate.outputs.zip_path }}" -d _ci_extract
+          PLUGIN_DIR=$(find _ci_extract -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [ -z "$PLUGIN_DIR" ]; then
+            echo "::error::Could not find extracted plugin directory."
+            exit 1
+          fi
+          echo "Plugin extracted to: $PLUGIN_DIR"
+          echo "PLUGIN_DIR=$PLUGIN_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify version drift
+        run: |
+          set -euo pipefail
+
+          BOOTSTRAP="$PLUGIN_DIR/zymarg-wc-product-grid.php"
+          README="$PLUGIN_DIR/readme.txt"
+
+          if [ ! -f "$BOOTSTRAP" ]; then
+            echo "::error::Plugin bootstrap file not found at $BOOTSTRAP"
+            exit 1
+          fi
+          if [ ! -f "$README" ]; then
+            echo "::error::readme.txt not found at $README"
+            exit 1
+          fi
+
+          # 1. Plugin header "Version:" line
+          HEADER_VERSION=$(grep -oE '^\s\*\s*Version:\s*[0-9]+\.[0-9]+\.[0-9]+' "$BOOTSTRAP" \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+
+          # 2. ZYMARG_WCPG_VERSION constant
+          CONST_VERSION=$(grep -oE "define\(\s*'ZYMARG_WCPG_VERSION'\s*,\s*'[0-9]+\.[0-9]+\.[0-9]+'" "$BOOTSTRAP" \
+            | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n 1)
+
+          # 3. readme.txt Stable tag
+          README_VERSION=$(grep -oE '^Stable tag:\s*[0-9]+\.[0-9]+\.[0-9]+' "$README" \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+
+          # 4. zip filename
+          ZIP_VERSION=$(basename "${{ steps.locate.outputs.zip_path }}" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+
+          echo "Plugin header  : ${HEADER_VERSION:-MISSING}"
+          echo "Constant       : ${CONST_VERSION:-MISSING}"
+          echo "readme.txt     : ${README_VERSION:-MISSING}"
+          echo "Zip filename   : ${ZIP_VERSION:-MISSING}"
+
+          FAIL=0
+          for v in "$HEADER_VERSION" "$CONST_VERSION" "$README_VERSION" "$ZIP_VERSION"; do
+            if [ -z "$v" ]; then
+              echo "::error::One or more version fields could not be extracted."
+              FAIL=1
+            fi
+          done
+
+          if [ "$FAIL" -eq 0 ] && { [ "$HEADER_VERSION" != "$CONST_VERSION" ] \
+              || [ "$HEADER_VERSION" != "$README_VERSION" ] \
+              || [ "$HEADER_VERSION" != "$ZIP_VERSION" ]; }; then
+            echo "::error::Version drift detected. All four locations must match."
+            FAIL=1
+          fi
+
+          if [ "$FAIL" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "OK: all four version fields match ($HEADER_VERSION)."
+
+      - name: PHP syntax lint (every .php file)
+        run: |
+          set -euo pipefail
+          ERRORS=0
+          while IFS= read -r -d '' file; do
+            if ! php -l "$file" > /dev/null 2>&1; then
+              echo "::error file=$file::PHP parse error"
+              php -l "$file" || true
+              ERRORS=$((ERRORS + 1))
+            fi
+          done < <(find "$PLUGIN_DIR" -type f -name "*.php" -print0)
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::error::$ERRORS PHP file(s) have parse errors."
+            exit 1
+          fi
+          echo "OK: all PHP files parse cleanly."
